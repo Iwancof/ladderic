@@ -28,17 +28,30 @@ where
 }
 
 #[derive(Debug)]
-pub struct DenseNetwork<ValueScl, BiasScl, WeightScl>
+pub struct Neuron<WeightScl, BiasScl> {
+    weight: Vec<WeightScl>,
+    bias: BiasScl,
+}
+
+#[derive(Debug)]
+pub struct Layer<ValueScl, WeightScl, BiasScl> {
+    params: Vec<Neuron<WeightScl, BiasScl>>,
+    afp: fn(ValueScl) -> ValueScl,
+}
+
+#[derive(Debug)]
+pub struct DenseNetwork<ValueScl, WeightScl, BiasScl>
 where
     ValueScl: Mul<WeightScl, Output = ValueScl>,
     ValueScl: Add<BiasScl, Output = ValueScl>,
 {
     working: [RefCell<Vec<ValueScl>>; 2],
     input_size: usize,
-    pub layers: Vec<(Vec<(Vec<WeightScl>, BiasScl)>, fn(ValueScl) -> ValueScl)>,
+    // pub layers: Vec<(Vec<(Vec<WeightScl>, BiasScl)>, fn(ValueScl) -> ValueScl)>,
+    pub layers: Vec<Layer<ValueScl, WeightScl, BiasScl>>,
 }
 
-impl<ValueScl, BiasScl, WeightScl> Display for DenseNetwork<ValueScl, BiasScl, WeightScl>
+impl<ValueScl, WeightScl, BiasScl> Display for DenseNetwork<ValueScl, WeightScl, BiasScl>
 where
     ValueScl: Mul<WeightScl, Output = ValueScl>,
     ValueScl: Add<BiasScl, Output = ValueScl>,
@@ -47,14 +60,14 @@ where
     WeightScl: Display,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        for (l, fp) in &self.layers {
-            writeln!(f, "{:?}:", fp)?;
-            for (wei, bia) in l {
+        for Layer { params, afp } in &self.layers {
+            writeln!(f, "{:?}:", afp)?;
+            for Neuron { weight, bias } in params {
                 write!(f, "  weight: ")?;
-                for b in wei {
+                for b in weight {
                     write!(f, "{} ", b)?;
                 }
-                write!(f, " bias: {}", bia)?;
+                write!(f, " bias: {}", bias)?;
                 writeln!(f, "")?;
             }
         }
@@ -63,7 +76,7 @@ where
     }
 }
 
-impl<ValueScl, BiasScl, WeightScl> DenseNetwork<ValueScl, BiasScl, WeightScl>
+impl<ValueScl, BiasScl, WeightScl> DenseNetwork<ValueScl, WeightScl, BiasScl>
 where
     ValueScl: Mul<WeightScl, Output = ValueScl>,
     ValueScl: Add<BiasScl, Output = ValueScl>,
@@ -93,19 +106,18 @@ where
                 (Vec::new(), input_size),
                 |(mut layers, prev_size), (layer_index, &(size, ac_fp))| {
                     let bias_weight = (0..size)
-                        .map(|dest_neuron| {
-                            (
-                                (0..prev_size)
-                                    .map(|src_neuron| {
-                                        gen_weight(layer_index, src_neuron, dest_neuron)
-                                    })
-                                    .collect(),
-                                gen_bias(layer_index, dest_neuron),
-                            )
+                        .map(|dest_neuron| Neuron {
+                            weight: (0..prev_size)
+                                .map(|src_neuron| gen_weight(layer_index, src_neuron, dest_neuron))
+                                .collect(),
+                            bias: gen_bias(layer_index, dest_neuron),
                         })
                         .collect();
 
-                    layers.push((bias_weight, ac_fp));
+                    layers.push(Layer {
+                        params: bias_weight,
+                        afp: ac_fp,
+                    });
                     (layers, size)
                 },
             )
@@ -129,7 +141,7 @@ where
 }
 
 impl<ValueScl, BiasScl, WeightScl> Network<ValueScl, ValueScl>
-    for DenseNetwork<ValueScl, BiasScl, WeightScl>
+    for DenseNetwork<ValueScl, WeightScl, BiasScl>
 where
     ValueScl: Default + Clone,
     ValueScl: Add<ValueScl, Output = ValueScl>,
@@ -139,7 +151,7 @@ where
     WeightScl: Clone,
 {
     fn output_size(&self) -> usize {
-        self.layers.last().unwrap().0.len()
+        self.layers.last().unwrap().params.len()
     }
 
     fn forward_in_place_unchecked(&self, inp: &[ValueScl], out: &mut [ValueScl]) {
@@ -151,22 +163,23 @@ where
         }
 
         let mut last_write = 0;
-        for (i, (wei_bia, fp)) in self.layers.iter().enumerate() {
+        for (i, Layer { params, afp }) in self.layers.iter().enumerate() {
             let from = self.working[i % 2].borrow_mut(); // Previous layer.
             let mut to = self.working[(i + 1) % 2].borrow_mut(); // Current layer.
             last_write = (i + 1) % 2;
 
-            for (to, (wei, bia)) in to.iter_mut().zip(wei_bia.iter()) {
+            // TODO: BUG! `to` must be restricted accessing by currett layer neurons number.
+            for (to, Neuron { weight, bias }) in to.iter_mut().zip(params.iter()) {
                 // to: Destination. wei: Weight. bia: Bias
                 *to = ValueScl::default();
 
                 // if ValueScl were primitive, clone can be replaced to copy.
-                for (from, wei) in from.iter().zip(wei.iter()) {
+                for (from, wei) in from.iter().zip(weight.iter()) {
                     *to = to.clone() + (from.clone() * wei.clone());
                 }
-                *to = to.clone() + bia.clone();
+                *to = to.clone() + bias.clone();
 
-                *to = fp(to.clone());
+                *to = afp(to.clone());
             }
         }
 
@@ -179,6 +192,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     fn linear(x: f64) -> f64 {
         x
@@ -188,26 +202,26 @@ mod tests {
     fn forward_test() {
         let mut dn = DenseNetwork::<f64, f64, f64>::new(2, &[(3, linear), (2, linear)]);
 
-        dn.layers[0].0[0].0[0] = 2.0;
-        dn.layers[0].0[0].0[1] = 0.0;
-        dn.layers[0].0[1].0[0] = 1.0;
-        dn.layers[0].0[1].0[1] = 1.0;
-        dn.layers[0].0[2].0[0] = 0.0;
-        dn.layers[0].0[2].0[1] = 2.0;
+        dn.layers[0].params[0].weight[0] = 2.0;
+        dn.layers[0].params[0].weight[1] = 0.0;
+        dn.layers[0].params[1].weight[0] = 1.0;
+        dn.layers[0].params[1].weight[1] = 1.0;
+        dn.layers[0].params[2].weight[0] = 0.0;
+        dn.layers[0].params[2].weight[1] = 2.0;
 
-        dn.layers[0].0[0].1 = 2.0;
-        dn.layers[0].0[1].1 = 2.0;
-        dn.layers[0].0[2].1 = 2.0;
+        dn.layers[0].params[0].bias = 2.0;
+        dn.layers[0].params[1].bias = 2.0;
+        dn.layers[0].params[2].bias = 2.0;
 
-        dn.layers[1].0[0].0[0] = 1.0;
-        dn.layers[1].0[0].0[1] = 1.0;
-        dn.layers[1].0[0].0[2] = 1.0;
-        dn.layers[1].0[1].0[0] = 0.0;
-        dn.layers[1].0[1].0[1] = 0.0;
-        dn.layers[1].0[1].0[2] = 1.0;
+        dn.layers[1].params[0].weight[0] = 1.0;
+        dn.layers[1].params[0].weight[1] = 1.0;
+        dn.layers[1].params[0].weight[2] = 1.0;
+        dn.layers[1].params[1].weight[0] = 0.0;
+        dn.layers[1].params[1].weight[1] = 0.0;
+        dn.layers[1].params[1].weight[2] = 1.0;
 
-        dn.layers[1].0[0].1 = 0.0;
-        dn.layers[1].0[1].1 = 0.0;
+        dn.layers[1].params[0].bias = 0.0;
+        dn.layers[1].params[1].bias = 0.0;
 
         let ret = dn.forward(&[3., 4.]);
 
@@ -239,5 +253,34 @@ mod tests {
         );
 
         let _ret = dn.forward(&[1., 2., 3.]);
+    }
+
+    #[test]
+    fn forward_test_2() {
+        let mut dn =
+            DenseNetwork::<f64, f64, f64>::new(3, &[(5, linear), (1, linear), (5, linear)]);
+
+        dn.layers[0].params[0].weight[0] = 1.;
+        dn.layers[1].params[0].weight[0] = 1.;
+        dn.layers[2].params[0].weight[0] = 1.;
+
+        let ret = dn.forward(&[1., 2., 3.]);
+        assert_eq!(ret, vec![1., 0., 0., 0., 0.]);
+    }
+
+    #[test]
+    fn forward_test_3() {
+        let mut dn = DenseNetwork::<f64, f64, f64>::new(
+            3,
+            &[(5, linear), (1, linear), (5, linear), (1, linear)],
+        );
+
+        dn.layers[0].params[0].weight[0] = 1.;
+        dn.layers[1].params[0].weight[0] = 1.;
+        dn.layers[2].params[0].weight[0] = 1.;
+        dn.layers[3].params[0].weight[0] = 1.;
+
+        let ret = dn.forward(&[1., 2., 3.]);
+        assert_eq!(ret, vec![1.]);
     }
 }
