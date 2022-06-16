@@ -74,7 +74,7 @@ where
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         for Layer { params, afp } in &self.layers {
-            writeln!(f, "{:p}:", afp as *const _)?;
+            writeln!(f, "{:p}:", *afp as *const ())?;
             for Neuron { weight, bias } in params {
                 write!(f, "  weight: ")?;
                 for b in weight {
@@ -124,7 +124,7 @@ where
             .enumerate()
             .fold(
                 (Vec::new(), input_size),
-                |(mut layers, prev_size), (layer_index, &(size, ac_fp))| {
+                |(mut layers, prev_size), (layer_index, &(size, afp))| {
                     let bias_weight = (0..size)
                         .map(|dest_neuron| Neuron {
                             weight: (0..prev_size)
@@ -136,7 +136,7 @@ where
 
                     layers.push(Layer {
                         params: bias_weight,
-                        afp: ac_fp,
+                        afp,
                     });
                     (layers, size)
                 },
@@ -210,9 +210,10 @@ where
                 }
 
                 *to = to.clone() + bias.clone();
-
-                *to = afp(from, to);
             }
+
+            let copyed = to.clone(); // if the activate function dose not use this, it will maybe removed.
+            *to = to.iter_mut().map(|r| afp(&copyed, &r)).collect();
         }
 
         for (buf, out) in self.working[last_write].iter_mut().zip(out) {
